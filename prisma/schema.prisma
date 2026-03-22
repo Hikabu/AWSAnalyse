@@ -1,0 +1,36 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id            String    @id
+  title         String
+  price         Float?
+  rating        Float?
+  reviewCount   Int?
+  imageUrl      String?
+  categorySlug  String
+  url           String
+  lastScrapedAt DateTime
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  reviews       Review[]
+}
+
+model Review {
+  id          String    @id
+  productId   String
+  author      String?
+  rating      Int
+  title       String?
+  body        String?
+  date        DateTime?
+  verified    Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+}

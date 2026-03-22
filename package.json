@@ -1,0 +1,33 @@
+{
+  "name": "amazon-parser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Amazon category product and review scraper with Prisma + PostgreSQL",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "playwright:install": "playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.5.0",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.7",
+    "pino": "^9.6.0",
+    "playwright": "1.42.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "pino-pretty": "^13.0.0",
+    "prisma": "^6.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}
