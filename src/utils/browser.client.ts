@@ -12,6 +12,8 @@ export type GetPageHtmlOptions = {
   waitForSelector?: string;
   /** Timeout for waitForSelector (ms). */
   waitTimeoutMs?: number;
+  /** Referrer for navigation (e.g. product page before reviews). */
+  referer?: string;
 };
 
 function randomBetween(min: number, max: number): number {
@@ -38,30 +40,38 @@ export class BrowserClient {
     logger.info('Browser launched');
   }
 
+  private getRandomUserAgent(): string {
+    const agents = [
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    ];
+    return agents[Math.floor(Math.random() * agents.length)]!;
+  }
+
   /**
-   * Opens a fresh browser context, loads the URL, optionally waits for a selector, then returns document HTML.
+   * Opens a fresh browser context per request, loads the URL, optionally waits for a selector, then returns document HTML.
    */
   async getPageHTML(url: string, options?: GetPageHtmlOptions): Promise<string> {
     if (!this.browser) {
       throw new Error('Browser not initialized. Call init() first.');
     }
 
+    const referer = options?.referer;
     const context = await this.browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      userAgent: this.getRandomUserAgent(),
       locale: 'en-US',
       timezoneId: 'America/New_York',
       viewport: { width: 1366, height: 768 },
       extraHTTPHeaders: {
         'Accept-Language': 'en-US,en;q=0.9',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-Site': referer ? 'same-origin' : 'none',
+        ...(referer ? { Referer: referer } : {}),
       },
     });
 
@@ -69,7 +79,7 @@ export class BrowserClient {
 
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+      if (['image', 'font', 'media'].includes(type)) {
         return route.abort();
       }
       return route.continue();
@@ -82,7 +92,7 @@ export class BrowserClient {
     logger.info({ url, delayMs }, 'Browser GET starting');
 
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
       if (options?.waitForSelector) {
         try {
