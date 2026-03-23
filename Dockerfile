@@ -16,4 +16,4 @@ RUN npm ci && npx playwright install chromium
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/prisma ./prisma
 EXPOSE 3000
-CMD ["node", "dist/index.js"]
+CMD ["sh", "-c", "npx prisma migrate dev --name init && npx node dist/index.js"]
