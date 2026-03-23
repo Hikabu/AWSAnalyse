@@ -35,6 +35,13 @@ async function main(): Promise<void> {
 
     logger.info('Starting Amazon scraper...');
 
+    // Ensure the category row exists once before the product loop.
+    // ensureCategory returns the internal cuid used as categoryId FK.
+    const categoryId = await productService.ensureCategory(
+      config.categorySlug,
+      config.categorySlug, // use slug as display name fallback; update if you have a human name
+    );
+
     let products: Awaited<ReturnType<ProductScraper['scrape']>>;
     try {
       products = await productScraper.scrape(CATEGORY_URL, { pages: config.maxPages });
@@ -65,21 +72,22 @@ async function main(): Promise<void> {
     for (const product of products) {
       seenAsins.push(product.asin);
       try {
-        const result = await productService.upsertProduct(product);
-        if (result.created) stats.productsCreated++;
-        else if (result.updated) stats.productsUpdated++;
+        const { created, updated, productId } = await productService.upsertProduct(product, categoryId);
+        if (created) stats.productsCreated++;
+        else if (updated) stats.productsUpdated++;
         else stats.productsSkipped++;
 
         const reviews = await reviewScraper.scrape(product.asin, product.reviewsUrl);
         const seenReviewIds: string[] = [];
         for (const review of reviews) {
           seenReviewIds.push(review.id);
-          const r = await reviewService.upsertReview(review);
+          // Pass the internal productId (cuid) — required for the compound unique lookup
+          const r = await reviewService.upsertReview(review, productId);
           if (r.created) stats.reviewsCreated++;
           else if (r.updated) stats.reviewsUpdated++;
           else stats.reviewsSkipped++;
         }
-        await reviewService.deactivateMissingReviews(product.asin, seenReviewIds);
+        await reviewService.deactivateMissingReviews(productId, seenReviewIds);
 
         await delay(randomBetween(config.requestDelayMinMs, config.requestDelayMaxMs));
       } catch (err) {
