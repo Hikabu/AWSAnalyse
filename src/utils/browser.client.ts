@@ -12,6 +12,8 @@ export type GetPageHtmlOptions = {
   waitForSelector?: string;
   /** Timeout for waitForSelector (ms). */
   waitTimeoutMs?: number;
+  /** Scroll to the bottom to trigger lazy-loaded content. */
+  scrollToBottom?: boolean;
   /** Referrer for navigation (e.g. product page before reviews). */
   referer?: string;
 };
@@ -93,6 +95,28 @@ export class BrowserClient {
 
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+
+      // Trigger lazy-loaded sections (Amazon often loads reviews only after scrolling).
+      if (options?.scrollToBottom) {
+        await page.evaluate(async () => {
+          await new Promise<void>((resolve) => {
+            let totalHeight = 0;
+            const distance = 800;
+            const g = globalThis as any;
+            const doc = g.document as any;
+
+            const timer = g.setInterval(() => {
+              g.scrollBy(0, distance);
+              totalHeight += distance;
+              if (totalHeight >= doc.body.scrollHeight - g.innerHeight) {
+                g.clearInterval(timer);
+                resolve();
+              }
+            }, 150);
+          });
+        });
+        await page.waitForTimeout(2000);
+      }
 
       if (options?.waitForSelector) {
         try {

@@ -5,6 +5,7 @@ import { ProductScraper } from './scrapers/product.scraper';
 import { ReviewScraper } from './scrapers/review.scraper';
 import { ProductService } from './services/product.service';
 import { ReviewService } from './services/review.service';
+import { ScrapeRunService } from './services/scrape-run.service';
 import { browserClient } from './utils/browser.client';
 import { runHealthChecks } from './utils/health.check';
 
@@ -20,6 +21,8 @@ async function main(): Promise<void> {
   await runHealthChecks();
 
   await browserClient.init();
+  const scrapeRunService = new ScrapeRunService();
+  let runId: string | null = null;
 
   try {
     const CATEGORY_URL = config.categoryUrl;
@@ -28,14 +31,19 @@ async function main(): Promise<void> {
     const reviewScraper = new ReviewScraper();
     const productService = new ProductService();
     const reviewService = new ReviewService();
+    runId = await scrapeRunService.startScrapeRun(config.categorySlug);
 
     logger.info('Starting Amazon scraper...');
 
-    let products;
+    let products: Awaited<ReturnType<ProductScraper['scrape']>>;
     try {
       products = await productScraper.scrape(CATEGORY_URL, { pages: config.maxPages });
     } catch (err) {
       logger.error({ err }, 'Failed to scrape product listing');
+      await scrapeRunService.failScrapeRun(
+        runId,
+        err instanceof Error ? err.message : String(err),
+      );
       process.exitCode = 1;
       return;
     }
@@ -46,26 +54,32 @@ async function main(): Promise<void> {
       productsCreated: 0,
       productsUpdated: 0,
       productsSkipped: 0,
+      productsDeactivated: 0,
       reviewsCreated: 0,
       reviewsUpdated: 0,
       reviewsSkipped: 0,
       productErrors: 0,
     };
 
+    const seenAsins: string[] = [];
     for (const product of products) {
+      seenAsins.push(product.asin);
       try {
         const result = await productService.upsertProduct(product);
         if (result.created) stats.productsCreated++;
         else if (result.updated) stats.productsUpdated++;
         else stats.productsSkipped++;
 
-        const reviews = await reviewScraper.scrape(product.asin);
+        const reviews = await reviewScraper.scrape(product.asin, product.reviewsUrl);
+        const seenReviewIds: string[] = [];
         for (const review of reviews) {
+          seenReviewIds.push(review.id);
           const r = await reviewService.upsertReview(review);
           if (r.created) stats.reviewsCreated++;
           else if (r.updated) stats.reviewsUpdated++;
           else stats.reviewsSkipped++;
         }
+        await reviewService.deactivateMissingReviews(product.asin, seenReviewIds);
 
         await delay(randomBetween(config.requestDelayMinMs, config.requestDelayMaxMs));
       } catch (err) {
@@ -74,7 +88,31 @@ async function main(): Promise<void> {
       }
     }
 
+    stats.productsDeactivated = await productService.deactivateMissingProducts(
+      config.categorySlug,
+      seenAsins,
+    );
+
+    await scrapeRunService.finishScrapeRun(runId, {
+      productsCreated: stats.productsCreated,
+      productsUpdated: stats.productsUpdated,
+      productsSkipped: stats.productsSkipped,
+      productsDeactivated: stats.productsDeactivated,
+      reviewsCreated: stats.reviewsCreated,
+      reviewsUpdated: stats.reviewsUpdated,
+      reviewsSkipped: stats.reviewsSkipped,
+    });
+
     logger.info(stats, 'Scrape complete');
+  } catch (err) {
+    if (runId) {
+      await scrapeRunService.failScrapeRun(
+        runId,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    logger.error({ err }, 'Fatal scrape error');
+    process.exitCode = 1;
   } finally {
     await browserClient.close();
   }

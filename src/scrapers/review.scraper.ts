@@ -3,24 +3,16 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as cheerio from 'cheerio';
 import type { Element } from 'domhandler';
-import { config } from '../config';
 import { logger } from '../logger';
 import type { ReviewDto } from '../types/dto';
 import { browserClient } from '../utils/browser.client';
 import { parseReviewDate } from '../utils/parser.utils';
 import { BaseScraper } from './base.scraper';
 
-const REVIEW_CONTAINER = 'div[data-hook="review"]';
-
-/** Increments each time `scrape` runs — used for adaptive delay between products (Fix 4) without changing `index.ts`. */
-let scrapeInvocationIndex = 0;
+const REVIEW_CARD_SELECTOR = 'div[id^="customer_review-"]';
 
 function randomBetween(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function stableReviewId(
@@ -34,171 +26,124 @@ function stableReviewId(
   return crypto.createHash('sha256').update(payload).digest('hex').slice(0, 40);
 }
 
-function reviewUrlFormats(asin: string, pageNum: number): string[] {
-  return [
-    `https://www.amazon.com/product-reviews/${encodeURIComponent(asin)}/ref=cm_cr_arp_d_viewopt_srt?ie=UTF8&reviewerType=all_reviews&sortBy=recent&pageNumber=${pageNum}`,
-    `https://www.amazon.com/product-reviews/${encodeURIComponent(asin)}?reviewerType=all_reviews&sortBy=recent&pageNumber=${pageNum}`,
-    `https://www.amazon.com/dp/${encodeURIComponent(asin)}?th=1#customerReviews`,
-    `https://www.amazon.com/review/product/${encodeURIComponent(asin)}?pageNumber=${pageNum}`,
-  ];
-}
+function parseUsReviewCard(
+  $: cheerio.CheerioAPI,
+  el: Element,
+  asin: string,
+  rawId: string,
+  dateText: string,
+): ReviewDto | null {
+  // Filtered to US already, but keep date extraction consistent.
+  const author = $(el).find('span.a-profile-name').first().text().trim() || null;
 
-async function fetchReviewPageHtml(asin: string, pageNum: number, productUrl: string): Promise<string> {
-  const formats = reviewUrlFormats(asin, pageNum);
-  const referer = productUrl;
+  // Rating: either hook can appear; parse "4.0 out of 5 stars"
+  const ratingText =
+    $(el)
+      .find(
+        'i[data-hook="review-star-rating"] .a-offscreen, i[data-hook="cmps-review-star-rating"] .a-offscreen, i[data-hook="review-star-rating"] .a-icon-alt, i[data-hook="cmps-review-star-rating"] .a-icon-alt',
+      )
+      .first()
+      .text()
+      .trim() || '';
 
-  for (const url of formats) {
-    const html = await browserClient.getPageHTML(url, {
-      referer,
-      delayMs: randomBetween(2000, 4000),
+  const ratingMatch = ratingText.match(/([0-9.]+)\s*out of/i);
+  const rating = ratingMatch ? Math.round(parseFloat(ratingMatch[1]!)) : 3;
+
+  // Title: pick the first span in [data-hook="review-title"] that is NOT inside an <i> star icon.
+  let title: string | null = null;
+  $(el)
+    .find('[data-hook="review-title"] span')
+    .each((_, spanEl) => {
+      if (title) return;
+      if ($(spanEl).parents('i').length > 0) return; // skip star-rating alt/icon spans
+      const text = $(spanEl).text().trim();
+      if (text) title = text;
     });
 
-    const $ = cheerio.load(html);
-    const hasReviews = $(REVIEW_CONTAINER).length > 0;
-    const hasLoginWall = html.includes('ap/signin') || html.includes('sign-in');
-    const hasEmptyState =
-      html.includes('no customer reviews') || html.includes('Be the first');
+  // Body: the real text is the innermost span inside review-collapsed.
+  const body =
+    $(el).find('[data-hook="review-collapsed"] span').first().text().trim() ||
+    $(el).find('[data-hook="review-body"] span').first().text().trim() ||
+    null;
 
-    if (hasReviews) {
-      logger.info({ asin, url, pageNum }, 'Review URL format worked');
-      return html;
-    }
+  const date = parseReviewDate(dateText);
 
-    if (hasLoginWall) {
-      logger.warn({ asin, url }, 'Review page hit login wall — trying next format');
-      continue;
-    }
+  const verified =
+    $(el).find('[data-hook="avp-badge"]').length > 0 ||
+    /verified\s+purchase/i.test($(el).text());
 
-    if (hasEmptyState) {
-      logger.info({ asin }, 'Product has no reviews yet');
-      return html;
-    }
+  const cleanId = rawId.replace('customer_review-', '');
+  const id = cleanId || stableReviewId(asin, author, title, body, date);
 
-    logger.warn({ asin, url, pageNum }, 'Review format returned no results — trying next');
-  }
-
-  logger.warn({ asin, pageNum }, 'All review URL formats failed — skipping reviews for this page');
-  return '';
+  return {
+    id,
+    productId: asin,
+    author,
+    rating: Number.isFinite(rating) ? Math.min(5, Math.max(1, rating)) : 3,
+    title,
+    body,
+    date,
+    verified,
+  };
 }
 
 /**
- * Parses Amazon product review listing pages (HTML from Playwright).
+ * Parses Amazon product pages to extract the first 3 US reviews.
+ * Reviews are lazy-loaded, so we must scroll to the bottom to force the DOM to render them.
  */
 export class ReviewScraper extends BaseScraper {
-  /**
-   * Fetches the first N pages of reviews for an ASIN (N from config.reviewPages).
-   * Failures are logged and an empty array is returned so the product pipeline is not aborted (Fix 6).
-   */
-  async scrape(asin: string): Promise<ReviewDto[]> {
+  async scrape(asin: string, reviewsUrl: string | null): Promise<ReviewDto[]> {
     try {
-      const productIndex = scrapeInvocationIndex++;
-      const baseDelay = randomBetween(4000, 8000);
-      const fatigueDelay = Math.floor(productIndex / 5) * 2000;
-      const totalDelay = baseDelay + fatigueDelay;
-      logger.info({ asin, productIndex, totalDelay }, 'Waiting before review scrape (adaptive)');
-      await delay(totalDelay);
-
       const productUrl = `https://www.amazon.com/dp/${encodeURIComponent(asin)}`;
+      // Prefer the card-provided reviewsUrl (usually ends with #customerReviews),
+      // but always fall back to the clean dp URL.
+      const targetUrl = reviewsUrl
+        ? reviewsUrl.startsWith('http://') || reviewsUrl.startsWith('https://')
+          ? reviewsUrl
+          : `https://www.amazon.com${reviewsUrl}`
+        : productUrl;
+      const finalTargetUrl = targetUrl.includes('#') ? targetUrl : `${productUrl}#customerReviews`;
 
-      logger.info({ asin }, 'Warming up session on product page');
-      await browserClient.getPageHTML(productUrl, {
+      logger.info({ asin, url: finalTargetUrl }, 'Fetching product page for top US reviews');
+
+      const html = await browserClient.getPageHTML(finalTargetUrl, {
+        referer: 'https://www.amazon.com/',
         delayMs: randomBetween(1500, 3000),
+        scrollToBottom: true,
+        waitForSelector: '[data-hook="review-date"]',
+        waitTimeoutMs: 12_000,
       });
 
+      const $ = cheerio.load(html);
       const out: ReviewDto[] = [];
-      const seen = new Set<string>();
-      const maxPages = config.reviewPages;
 
-      const REVIEW_ID = ($: cheerio.CheerioAPI, el: Element) => $(el).attr('id')?.trim() ?? '';
-      const AUTHOR = ($: cheerio.CheerioAPI, el: Element) =>
-        $(el).find('span.a-profile-name').text().trim();
-      const RATING_R = ($: cheerio.CheerioAPI, el: Element): number => {
-        const text = $(el)
-          .find(
-            'i[data-hook="review-star-rating"] span.a-offscreen, i[data-hook="cmps-review-star-rating"] span.a-offscreen',
-          )
-          .first()
-          .text()
-          .replace(' out of 5 stars', '')
-          .trim();
-        const n = Number.parseInt(text, 10);
-        return Number.isFinite(n) ? n : NaN;
-      };
-      const TITLE_R = ($: cheerio.CheerioAPI, el: Element) =>
-        $(el).find('a[data-hook="review-title"] span:not(.a-icon-alt)').text().trim();
-      const BODY_R = ($: cheerio.CheerioAPI, el: Element) =>
-        $(el).find('span[data-hook="review-body"] span').text().trim();
-      const DATE_R = ($: cheerio.CheerioAPI, el: Element) => {
-        const raw = $(el).find('span[data-hook="review-date"]').text().trim();
-        const stripped = raw.replace('Reviewed in the United States on ', '').trim();
-        return { raw, stripped };
-      };
-      const VERIFIED_R = ($: cheerio.CheerioAPI, el: Element) =>
-        $(el).find('span[data-hook="avp-badge"]').length > 0;
+      $(REVIEW_CARD_SELECTOR).each((_, el) => {
+        if (out.length >= 3) return;
 
-      for (let page = 1; page <= maxPages; page++) {
-        if (page > 1) {
-          await delay(randomBetween(2000, 4000));
-        }
+        const rawId = $(el).attr('id')?.trim() ?? '';
+        if (!rawId || !rawId.startsWith('customer_review-')) return;
 
-        const html = await fetchReviewPageHtml(asin, page, productUrl);
-        if (!html) {
-          continue;
-        }
+        // Foreign reviews have ids like "customer_review_foreign-R..."
+        if (rawId.includes('_foreign')) return;
 
-        const $ = cheerio.load(html);
-        const reviewCount = $(REVIEW_CONTAINER).length;
-        const likelyEmptyProduct =
-          html.includes('no customer reviews') || html.includes('Be the first');
+        const dateText = $(el).find('[data-hook="review-date"]').first().text().trim();
+        if (!dateText.includes('United States')) return;
 
-        if (reviewCount === 0 && !likelyEmptyProduct) {
-          const dumpPath = path.join(process.cwd(), `debug_reviews_${asin}_page${page}.html`);
-          fs.writeFileSync(dumpPath, html, 'utf-8');
-          logger.warn({ asin, page, dumpPath }, 'No reviews found — HTML dumped for inspection');
-        }
+        const review = parseUsReviewCard($, el, asin, rawId, dateText);
+        if (review) out.push(review);
+      });
 
-        $(REVIEW_CONTAINER).each((_, el) => {
-          let id = REVIEW_ID($, el);
-          const author = AUTHOR($, el) || null;
-          const title = TITLE_R($, el) || null;
-          const body = BODY_R($, el) || null;
-          const { raw: dateRawFull, stripped: dateStripped } = DATE_R($, el);
-          const date =
-            parseReviewDate(dateStripped) ?? parseReviewDate(dateRawFull);
-
-          if (!id || !/^R[A-Z0-9]+$/i.test(id)) {
-            id = stableReviewId(asin, author, title, body, date);
-          }
-
-          if (seen.has(id)) return;
-          seen.add(id);
-
-          let ratingVal = RATING_R($, el);
-          if (!Number.isFinite(ratingVal) || ratingVal < 1 || ratingVal > 5) {
-            ratingVal = 3;
-          }
-
-          const verified = VERIFIED_R($, el) || /verified\s+purchase/i.test($(el).text());
-
-          out.push({
-            id,
-            productId: asin,
-            author,
-            rating: ratingVal,
-            title,
-            body,
-            date,
-            verified,
-          });
-        });
+      if (out.length === 0) {
+        const dumpPath = path.join(process.cwd(), 'debug', `reviews_${asin}.html`);
+        fs.mkdirSync(path.dirname(dumpPath), { recursive: true });
+        fs.writeFileSync(dumpPath, html, 'utf-8');
+        logger.warn({ asin, dumpPath }, '0 US reviews extracted — HTML dumped for inspection');
       }
 
+      logger.info({ asin, count: out.length }, 'Reviews scraped');
       return out;
     } catch (err) {
-      logger.warn(
-        { asin, err },
-        'Review scrape failed — skipping reviews for this product (product already saved if pipeline ran)',
-      );
+      logger.warn({ asin, err }, 'Review scrape failed — returning empty list');
       return [];
     }
   }

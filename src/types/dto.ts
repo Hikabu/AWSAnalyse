@@ -8,6 +8,7 @@ export interface ProductDto {
   imageUrl: string | null;
   categorySlug: string;
   url: string;
+  reviewsUrl: string | null;
 }
 
 /** Single review from a product-reviews page. */

@@ -10,6 +10,7 @@ function reviewChanged(
     body: string | null;
     date: Date | null;
     verified: boolean;
+    isActive: boolean;
   },
   dto: ReviewDto,
 ): boolean {
@@ -19,7 +20,8 @@ function reviewChanged(
     existing.title !== dto.title ||
     existing.body !== dto.body ||
     existing.date?.getTime() !== dto.date?.getTime() ||
-    existing.verified !== dto.verified
+    existing.verified !== dto.verified ||
+    existing.isActive === false
   );
 }
 
@@ -41,6 +43,7 @@ export class ReviewService {
           body: dto.body,
           date: dto.date,
           verified: dto.verified,
+          isActive: true,
         },
       });
       logger.info(
@@ -67,6 +70,7 @@ export class ReviewService {
         body: dto.body,
         date: dto.date,
         verified: dto.verified,
+        isActive: true,
       },
     });
     logger.info(
@@ -74,5 +78,26 @@ export class ReviewService {
       'Review upsert: updated',
     );
     return { created: false, updated: true, skipped: false };
+  }
+
+  async deactivateMissingReviews(productId: string, seenReviewIds: string[]): Promise<number> {
+    const where = {
+      productId,
+      isActive: true,
+      ...(seenReviewIds.length > 0 ? { id: { notIn: seenReviewIds } } : {}),
+    };
+
+    const result = await prisma.review.updateMany({
+      where,
+      data: { isActive: false },
+    });
+
+    if (result.count > 0) {
+      logger.info(
+        { productId, count: result.count },
+        'Reviews deactivated (not seen in this run)',
+      );
+    }
+    return result.count;
   }
 }

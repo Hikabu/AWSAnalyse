@@ -112,6 +112,32 @@ function extractReviewCount($: cheerio.CheerioAPI, el: Element): number | null {
   return null;
 }
 
+function extractReviewsUrl(
+  $: cheerio.CheerioAPI,
+  el: Element,
+  asin: string,
+): string | null {
+  let found: string | null = null;
+
+  $(el)
+    .find('a[href*="#customerReviews"]')
+    .each((_, a) => {
+      if (found) return;
+      const label = ($(a).attr('aria-label') ?? '').toLowerCase();
+      const href = ($(a).attr('href') ?? '').trim();
+
+      if (label.includes('rating') && href.includes('#customerReviews')) {
+        found = href.startsWith('http') ? href : `https://www.amazon.com${href}`;
+      }
+    });
+
+  if (!found) {
+    found = `https://www.amazon.com/dp/${encodeURIComponent(asin)}#customerReviews`;
+  }
+
+  return found;
+}
+
 /**
  * Parses Amazon search / category listing pages into product DTOs.
  * HTML is loaded via Playwright + stealth; cheerio parses the response.
@@ -181,8 +207,12 @@ export class ProductScraper extends BaseScraper {
         const productUrl =
           toAmazonAbsoluteUrl(rawHref) ?? `https://www.amazon.com/dp/${asin}`;
 
+        const reviewsUrl = extractReviewsUrl($, el, asin);
+
+        logger.debug({ asin, reviewsUrl }, 'Reviews URL extracted from card');
+
         logger.debug(
-          { cardIndex: i, asin, title: title.slice(0, 50), price, rating },
+          { cardIndex: i, asin, title: title.slice(0, 50), price, rating, reviewsUrl },
           'ACCEPT: card parsed',
         );
 
@@ -195,6 +225,7 @@ export class ProductScraper extends BaseScraper {
           reviewCount,
           imageUrl,
           categorySlug,
+          reviewsUrl,
         });
       });
 
